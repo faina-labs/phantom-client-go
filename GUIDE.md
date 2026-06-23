@@ -8,7 +8,7 @@ Bypasses the REST API entirely: sub-millisecond publish, zero-loss durability, c
 ## Contents
 
 1. [Why this exists](#why-this-exists)
-2. [Publishing the module](#publishing-the-module)
+2. [Module info & versioning](#module-info--versioning)
 3. [Installing in faina-api](#installing-in-faina-api)
 4. [API reference](#api-reference)
 5. [Migrating from REST API](#migrating-from-rest-api)
@@ -44,55 +44,29 @@ faina-api  →  NATS JetStream (phantom.ingest)  →  phantom consumer  →  ES
 
 ---
 
-## Publishing the module
+## Module info & versioning
 
-Module: `github.com/faina-labs/phantom-client-go`
-Repo: `https://github.com/faina-labs/phantom-client-go`
+| | |
+|---|---|
+| **Module** | `github.com/faina-labs/phantom-client-go` |
+| **Repo** | https://github.com/faina-labs/phantom-client-go |
+| **Latest** | `v0.1.0` |
+| **Visibility** | Public — no auth config needed |
 
-### Tagging a release
+### Releasing a new version
 
 ```bash
-cd phantom-client-go/    # the standalone repo root
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.X.0
+git push origin v0.X.0
 ```
 
-Each semver tag becomes a module version on pkg.go.dev and is fetchable via `go get`.
+Each semver tag is immediately fetchable via `go get` and indexed on pkg.go.dev.
 
-### Configuring private module access in faina-api's environment
+### Local development against an unreleased version
 
-If the GitHub repo is **private**, add this to faina-api's CI and developer env:
-
-```bash
-# Skip the public checksum DB for this private module
-export GONOSUMDB="github.com/faina-labs/*"
-export GOPRIVATE="github.com/faina-labs/*"
-
-# Git must be able to authenticate to GitHub (pick one):
-# Option 1 — SSH key already configured (preferred)
-git config --global url."git@github.com:".insteadOf "https://github.com/"
-
-# Option 2 — Personal access token
-export GOAUTH="basic github.com <username>:<pat>"
-```
-
-If the repo is **public**, no extra config is needed — `go get` works out of the box.
-
-### Install in faina-api
+**Option A — Go workspace** (recommended when faina-api and phantom-client-go are cloned side by side):
 
 ```bash
-cd faina-api/
-go get github.com/faina-labs/phantom-client-go@v0.1.0
-```
-
----
-
-### Option B — Go workspace (local development)
-
-Use when faina-api and phantom-client-go are cloned on the same machine.
-
-```bash
-# Assuming layout:
 # /projects/
 #   phantom-client-go/
 #   faina-api/
@@ -113,16 +87,9 @@ use (
 )
 ```
 
-Import in faina-api:
-```go
-import phantom "github.com/faina-labs/phantom-client-go"
-```
+Do not commit `go.work` — it's in `.gitignore`.
 
-No `go get` needed. Workspace resolves from disk. Do not commit `go.work` — add it to `.gitignore`.
-
----
-
-### Option C — `replace` directive (quick test)
+**Option B — `replace` directive** (quick, single machine):
 
 Add to faina-api's `go.mod`:
 
@@ -132,22 +99,17 @@ require github.com/faina-labs/phantom-client-go v0.0.0
 replace github.com/faina-labs/phantom-client-go => ../phantom-client-go
 ```
 
-Remove before shipping — `replace` directives break downstream consumers.
+Remove before merging — `replace` breaks downstream consumers.
 
 ---
 
 ## Installing in faina-api
 
-After `go get` (Option A) or workspace setup (Option B/C):
-
 ```bash
-# Option A
-go get github.com/faina-labs/phantom-client-go@latest
-
-# Options B/C — already available via go.work / replace
+go get github.com/faina-labs/phantom-client-go@v0.1.0
 ```
 
-Import path (same regardless of install method):
+Import path:
 ```go
 import phantom "github.com/faina-labs/phantom-client-go"
 ```
@@ -670,14 +632,13 @@ NATS handles all of that.
 
 ## Checklist: migrating faina-api
 
-- [ ] Choose distribution method (Option A/B/C above)
-- [ ] Add `phantom-client-go` dependency to faina-api
-- [ ] Initialize `phantom.Client` once at startup with NATS URL
+- [ ] `go get github.com/faina-labs/phantom-client-go@v0.1.0`
+- [ ] Initialize `phantom.Client` once at startup with `NATS_URL`
 - [ ] Replace REST calls to `/ingest` with `client.Ingest`
 - [ ] Map existing event fields using the field mapping table above
+- [ ] Add `NATS_URL` env var pointing to the shared NATS cluster
 - [ ] Remove `PHANTOM_API_KEY` env var (no longer needed for event publishing)
-- [ ] Add `NATS_URL` env var pointing to shared NATS cluster
-- [ ] Test with phantom consumer running: verify events appear in ES
-- [ ] Test with phantom consumer stopped: verify events appear in ES after consumer restarts
 - [ ] Remove HTTP client / retry logic for phantom ingest (NATS handles it)
+- [ ] Test with phantom consumer running — verify events appear in ES
+- [ ] Test with phantom consumer stopped — verify events appear in ES after consumer restarts
 - [ ] After full rollout: remove TRACKING_EVENTS consumer from phantom (coordinate with phantom team)
