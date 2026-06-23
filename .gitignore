@@ -1,0 +1,22 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+coverage.html
+
+# Go workspace (local only — not for CI)
+go.work
+go.work.sum
+
+# Editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
