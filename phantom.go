@@ -14,6 +14,16 @@
 //	    phantom.WithBuffer(500, 10*time.Millisecond),
 //	)
 //
+// Shared connection — multiple clients, one TCP connection per pod:
+//
+//	conn, _ := nats.Connect(url, nats.MaxReconnects(-1), nats.ReconnectWait(time.Second))
+//	syncClient, _   := phantom.NewClientWithConn(conn)
+//	pixelClient, _  := phantom.NewClientWithConn(conn, phantom.WithBuffer(500, 10*time.Millisecond))
+//	// shutdown — caller closes conn last:
+//	pixelClient.Close()
+//	syncClient.Close()
+//	conn.Close()
+//
 // Module: github.com/faina-labs/phantom-client-go
 package phantom
 
@@ -114,6 +124,7 @@ func WithBuffer(maxEvents int, maxAge time.Duration) Option {
 type Client struct {
 	conn     *nats.Conn
 	js       jetstream.JetStream
+	ownsConn bool // true when NewClient created conn; false when NewClientWithConn
 	stream   string
 	subject  string
 	maxBatch int
@@ -126,7 +137,8 @@ type Client struct {
 	bufDone      chan struct{}
 }
 
-// NewClient creates and connects a Phantom Tracker client.
+// NewClient creates a Phantom Tracker client and opens a dedicated NATS connection.
+// Close() will close the connection. Use NewClientWithConn to share a connection.
 func NewClient(natsURL string, opts ...Option) (*Client, error) {
 	conn, err := nats.Connect(natsURL,
 		nats.MaxReconnects(-1),
@@ -136,9 +148,25 @@ func NewClient(natsURL string, opts ...Option) (*Client, error) {
 		return nil, fmt.Errorf("phantom: failed to connect to NATS: %w", err)
 	}
 
-	js, err := jetstream.New(conn)
+	c, err := newClient(conn, opts...)
 	if err != nil {
 		conn.Close()
+		return nil, err
+	}
+	c.ownsConn = true
+	return c, nil
+}
+
+// NewClientWithConn creates a Phantom Tracker client using an existing NATS connection.
+// The caller owns the connection lifecycle — Close() flushes the buffer but does NOT
+// close conn. Call conn.Close() explicitly after all clients sharing it are closed.
+func NewClientWithConn(conn *nats.Conn, opts ...Option) (*Client, error) {
+	return newClient(conn, opts...)
+}
+
+func newClient(conn *nats.Conn, opts ...Option) (*Client, error) {
+	js, err := jetstream.New(conn)
+	if err != nil {
 		return nil, fmt.Errorf("phantom: failed to create JetStream context: %w", err)
 	}
 
@@ -295,13 +323,16 @@ func (c *Client) runBuffer() {
 	}
 }
 
-// Close flushes the buffer (if in buffered mode) and closes the NATS connection.
+// Close flushes the buffer (if in buffered mode) and, when the client owns its
+// NATS connection (created via NewClient), closes it. When the connection was
+// provided via NewClientWithConn, Close() does NOT close the connection — the
+// caller must call conn.Close() explicitly after all sharing clients are closed.
 func (c *Client) Close() {
 	if c.buf != nil {
 		close(c.bufStop)
 		<-c.bufDone
 	}
-	if c.conn != nil {
+	if c.ownsConn && c.conn != nil {
 		c.conn.Close()
 	}
 }
