@@ -24,7 +24,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -96,7 +95,6 @@ type Client struct {
 	stream   string
 	subject  string
 	maxBatch int
-	mu       sync.Mutex
 }
 
 // NewClient creates and connects a Phantom Tracker client.
@@ -133,6 +131,7 @@ func NewClient(natsURL string, opts ...Option) (*Client, error) {
 // Splits events into batches of up to MaxBatch per NATS message.
 // Returns after JetStream acknowledgment — guarantees durability (<0.5ms per batch).
 // Returns error if any batch fails; successfully published batches are not rolled back.
+// Safe for concurrent use — nats.go JetStream handles locking internally.
 func (c *Client) Ingest(ctx context.Context, events []Event) error {
 	if len(events) == 0 {
 		return nil
@@ -150,9 +149,6 @@ func (c *Client) Ingest(ctx context.Context, events []Event) error {
 			events[i].Timestamp = time.Now()
 		}
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	for i := 0; i < len(events); i += c.maxBatch {
 		end := i + c.maxBatch
