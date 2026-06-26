@@ -14,11 +14,22 @@
 //	    phantom.WithBuffer(500, 10*time.Millisecond),
 //	)
 //
+// Buffered + async publish — removes the NATS ack bottleneck from the drain goroutine.
+// Use for pixel/impression tracking where throughput > durability:
+//
+//	client, err := phantom.NewClient("nats://localhost:4222",
+//	    phantom.WithBuffer(500, 10*time.Millisecond),
+//	    phantom.WithAsyncPublish(4096),
+//	)
+//
 // Shared connection — multiple clients, one TCP connection per pod:
 //
 //	conn, _ := nats.Connect(url, nats.MaxReconnects(-1), nats.ReconnectWait(time.Second))
 //	syncClient, _   := phantom.NewClientWithConn(conn)
-//	pixelClient, _  := phantom.NewClientWithConn(conn, phantom.WithBuffer(500, 10*time.Millisecond))
+//	pixelClient, _  := phantom.NewClientWithConn(conn,
+//	    phantom.WithBuffer(500, 10*time.Millisecond),
+//	    phantom.WithAsyncPublish(4096),
+//	)
 //	// shutdown — caller closes conn last:
 //	pixelClient.Close()
 //	syncClient.Close()
@@ -49,6 +60,9 @@ const (
 	retryMaxTotal = 30 * time.Second
 	retryInitial  = 100 * time.Millisecond
 	retryCap      = 5 * time.Second
+
+	// asyncDrainTimeout is the max time Close() waits for outstanding async acks.
+	asyncDrainTimeout = 5 * time.Second
 )
 
 // Event is a single analytics event to be published to Phantom Tracker.
@@ -112,10 +126,31 @@ func WithMaxBatch(n int) Option {
 //
 // Use for pixel/impression tracking where throughput matters more than per-call durability.
 // For paths where callers need ack before responding (e.g. TrackBatch), use a non-buffered client.
+//
+// Pair with WithAsyncPublish to also remove the NATS ack wait from the drain goroutine.
 func WithBuffer(maxEvents int, maxAge time.Duration) Option {
 	return func(c *Client) {
 		c.bufMaxEvents = maxEvents
 		c.bufMaxAge = maxAge
+	}
+}
+
+// WithAsyncPublish switches the buffer drain goroutine from js.Publish (sync, waits for ack)
+// to js.PublishAsync (fire-and-forget). This removes the serial NATS ack bottleneck: the
+// drain goroutine is never blocked by publish latency, so the internal buffer drains at wire
+// speed regardless of NATS round-trip time.
+//
+// maxPending caps the number of outstanding unacknowledged async publishes. When the cap is
+// reached, the drain goroutine yields briefly until acks arrive. 0 disables the cap (no
+// backpressure — true fire-and-forget). 4096 is a reasonable default for most workloads.
+//
+// Close() waits up to 5 seconds for all pending async acks before closing the connection.
+//
+// Must be combined with WithBuffer — has no effect in sync mode.
+func WithAsyncPublish(maxPending int) Option {
+	return func(c *Client) {
+		c.asyncPublish = true
+		c.asyncMaxPending = maxPending
 	}
 }
 
@@ -135,6 +170,10 @@ type Client struct {
 	bufMaxAge    time.Duration
 	bufStop      chan struct{}
 	bufDone      chan struct{}
+
+	// async publish — only active when asyncPublish=true and buf!=nil
+	asyncPublish    bool
+	asyncMaxPending int
 }
 
 // NewClient creates a Phantom Tracker client and opens a dedicated NATS connection.
@@ -165,21 +204,22 @@ func NewClientWithConn(conn *nats.Conn, opts ...Option) (*Client, error) {
 }
 
 func newClient(conn *nats.Conn, opts ...Option) (*Client, error) {
-	js, err := jetstream.New(conn)
-	if err != nil {
-		return nil, fmt.Errorf("phantom: failed to create JetStream context: %w", err)
-	}
-
 	c := &Client{
 		conn:     conn,
-		js:       js,
 		stream:   defaultStream,
 		subject:  defaultSubject,
 		maxBatch: defaultMaxBatch,
 	}
+	// Apply options before creating JetStream so asyncMaxPending is known.
 	for _, opt := range opts {
 		opt(c)
 	}
+
+	js, err := jetstream.New(conn)
+	if err != nil {
+		return nil, fmt.Errorf("phantom: failed to create JetStream context: %w", err)
+	}
+	c.js = js
 
 	if c.bufMaxEvents > 0 {
 		c.buf = make(chan Event, c.bufMaxEvents*10)
@@ -282,8 +322,32 @@ func (c *Client) publishWithRetry(ctx context.Context, data []byte) error {
 	}
 }
 
+// publishAsyncBatch sends a batch using js.PublishAsync — does not wait for NATS acks.
+// The drain goroutine never blocks, allowing the buffer to be drained at wire speed.
+// When asyncMaxPending > 0, applies backpressure if too many acks are outstanding.
+func (c *Client) publishAsyncBatch(events []Event) {
+	for i := 0; i < len(events); i += c.maxBatch {
+		end := i + c.maxBatch
+		if end > len(events) {
+			end = len(events)
+		}
+		data, err := json.Marshal(ingestBatch{Events: events[i:end]})
+		if err != nil {
+			continue // best-effort
+		}
+		// Yield until outstanding acks fall below the cap.
+		if c.asyncMaxPending > 0 {
+			for c.js.PublishAsyncPending() >= c.asyncMaxPending {
+				time.Sleep(time.Millisecond)
+			}
+		}
+		_, _ = c.js.PublishAsync(c.subject, data) // errors are best-effort in buffered mode
+	}
+}
+
 // runBuffer is the background goroutine for buffered mode.
 // Flushes when batch reaches bufMaxEvents or bufMaxAge elapses.
+// In async mode, flush does not block on NATS acks.
 func (c *Client) runBuffer() {
 	defer close(c.bufDone)
 
@@ -296,9 +360,13 @@ func (c *Client) runBuffer() {
 		if len(batch) == 0 {
 			return
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), retryMaxTotal)
-		defer cancel()
-		_ = c.publish(ctx, batch) // best-effort: errors dropped in buffered mode
+		if c.asyncPublish {
+			c.publishAsyncBatch(batch)
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), retryMaxTotal)
+			defer cancel()
+			_ = c.publish(ctx, batch) // best-effort: errors dropped in buffered mode
+		}
 		batch = batch[:0]
 	}
 
@@ -327,10 +395,20 @@ func (c *Client) runBuffer() {
 // NATS connection (created via NewClient), closes it. When the connection was
 // provided via NewClientWithConn, Close() does NOT close the connection — the
 // caller must call conn.Close() explicitly after all sharing clients are closed.
+//
+// In async publish mode, Close() waits up to 5 seconds for outstanding NATS acks
+// to complete before closing the connection.
 func (c *Client) Close() {
 	if c.buf != nil {
 		close(c.bufStop)
 		<-c.bufDone
+		// Wait for outstanding async acks before closing the connection.
+		if c.asyncPublish {
+			select {
+			case <-c.js.PublishAsyncComplete():
+			case <-time.After(asyncDrainTimeout):
+			}
+		}
 	}
 	if c.ownsConn && c.conn != nil {
 		c.conn.Close()
